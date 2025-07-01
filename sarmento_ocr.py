@@ -5,14 +5,32 @@ import pandas as pd
 import numpy as np
 import time
 import os
-
 from PIL import Image, ImageChops, ImageFilter
 #from joblib import Parallel, delayed
 import re
 import csv
 
-ground_truth = {}
 
+OCR_CUTOFF = 0.6          # Limite mínimo de confiança para considerar um resultado do OCR
+IMG_MAG = 4               # Fator de ampliação da imagem antes do OCR (aumenta a legibilidade)
+BIN_THRESHOLD = 200       # Valor de limiar para binarização da imagem (0-255)
+IMG_BLUR = 1              # Intensidade do desfoque aplicado antes da binarização
+VERBOSE = False           # Ativa/desativa saída detalhada no console
+save_step = 500           # Número de imagens processadas antes de salvar os resultados parciais
+OUTPUT_DIR = "output"     # Diretório onde os arquivos de saída serão salvos
+IMAGES_DIR = "imagens"    # Diretório de entrada contendo as imagens a serem processadas
+RECORTES_DIR = 'recortes' # Diretório onde serão salvas imagens recortadas (regiões de interesse)
+
+dictionary_list_p1 = []   # Lista de dicionários da primeira etapa de extração
+dictionary_list_p2 = []   # Lista de dicionários da segunda etapa de extração (se houver)
+row_data = {}             # Dicionário temporário para armazenar dados de uma imagem específica
+ground_truth = {}         # Dicionário para armazenar os valores esperados de cada variável
+
+
+'''
+Leitura da "ground truth" (valores esperados) a partir de um arquivo CSV.
+Esses dados servirão como base de comparação ou validação para os resultados do OCR.
+'''
 with open('ground_truth.csv', newline='', encoding='utf-8') as csvfile:
     reader = csv.DictReader(csvfile, delimiter=';')
     for row in reader:
@@ -21,43 +39,41 @@ with open('ground_truth.csv', newline='', encoding='utf-8') as csvfile:
         ground_truth[chave] = valor
 
 
-OCR_CUTOFF = 0.6 # OCR cutoff to include result
-IMG_MAG = 4 # Image magnification  
-BIN_THRESHOLD = 200 # binarization threshold
-IMG_BLUR = 1
-VERBOSE = False
-save_step = 500
-OUTPUT_DIR = "output"
-IMAGES_DIR = "imagens"
-RECORTES_DIR = 'recortes'
-dictionary_list_p1 = []
-dictionary_list_p2 = []
-row_data = {}
-
-#binarization function
+'''
+Função de binarização de imagem.
+Converte a imagem para tons de cinza e aplica um limiar para transformá-la em uma imagem binária (preto e branco).
+Essa etapa é importante para melhorar a performance do OCR ao eliminar ruído e focar no contraste entre texto e fundo.
+'''
 def binarize(img, thresh=200):  
-  #convert image to greyscale
-  img=img.convert('L') 
+  img=img.convert('L') # Converte a imagem para escala de cinza
   width,height=img.size
-  #traverse through pixels 
-  for x in range(width):
+
+  for x in range(width):  #Varre os pixels da imagem
     for y in range(height):
-      #if intensity less than threshold, assign white
+
       if img.getpixel((x,y)) < thresh:
-        img.putpixel((x,y),0)
-      #if intensity greater than threshold, assign black 
+        img.putpixel((x,y),0) # Se intensidade menor que o limiar, atribui preto
       else:
-        img.putpixel((x,y),255)
+        img.putpixel((x,y),255) #Se intensidade maior ou igual ao limiar, atribui branco
   return img
 
+
+'''
+Função para recortar automaticamente as bordas vazias de uma imagem.
+Utiliza a diferença entre a imagem e seu plano de fundo para identificar a região com conteúdo relevante.
+'''
 def trim_img(im):
-  bg = Image.new(im.mode, im.size, im.getpixel((0,0)))
-  diff = ImageChops.difference(im, bg)
-  diff = ImageChops.add(diff, diff, 2.0, -100)
-  bbox = diff.getbbox()
+  bg = Image.new(im.mode, im.size, im.getpixel((0,0))) # Cria uma imagem de fundo com a mesma cor do canto superior esquerdo
+  diff = ImageChops.difference(im, bg)  # Calcula a diferença entre a imagem original e o fundo
+  diff = ImageChops.add(diff, diff, 2.0, -100) # Aumenta o contraste da diferença para facilitar a detecção das bordas
+  bbox = diff.getbbox() # Obtém o menor retângulo (bounding box) que contém todos os pixels diferentes do fundo
   if bbox:
     return im.crop(bbox)
 
+
+'''
+Redimensiona a imagem com base em um fator de ampliação.
+'''
 def resize_img(img, magnification, binarize_thresh=-1):
   width, height = img.size
   im = img.resize((width*magnification,height*magnification), Image.Resampling.LANCZOS)
@@ -66,6 +82,11 @@ def resize_img(img, magnification, binarize_thresh=-1):
   return im
 
 
+'''
+Função que retorna os recortes (crops) de regiões específicas da imagem com base em um padrão de layout.
+Cada entrada no dicionário define uma região de interesse com as seguintes informações: [x, y, largura, altura, caracteres válidos esperados]
+Usado para extrair campos como nome do paciente, data do exame, olho examinado, etc.
+'''
 def info_crops(padrao):
   try:
     if padrao == 1:
@@ -94,6 +115,12 @@ def info_crops(padrao):
     pass
 
 
+'''
+Função que define os recortes das regiões contendo dados dos exames oftalmológicos.
+A estrutura varia conforme o layout identificado pelo parâmetro `padrao`.
+Cada campo é representado por: [x, y, largura, altura, caracteres esperados]
+Esses recortes são usados para extrair informações como curvaturas, espessuras, potências e métricas epiteliais via OCR.
+'''
 def exam_crops(padrao):
   try:
     if padrao == 1:
@@ -161,28 +188,32 @@ def exam_crops(padrao):
     pass
 
 
-#======================Variáveis de referência para a leitura das imagens padrão 1: 4 imagens das cornias
+'''
+Definição das regiões (coordenadas) onde o OCR deve extrair valores específicos de mapas de espessura da córnea
+e da epitélio, tanto para o olho direito (OD) quanto para o olho esquerdo (OS), em dois padrões de layout diferentes.
+'''
+
+# Variáveis de dimensão padrão dos recortes utilizados
 L = 45 # Largura
 A = 15 # Altura
 
-#Mapeamento dos pontos para obtencao dos valores das imagens das cornias: [esquerda, topo]
 pachymetry_od_crops = { 
-  'CO': [270,230],
-  'S1': [268,146],
+  'CO': [270,230],  # Centro óptico
+  'S1': [268,146],  # Região superior
   'S2': [268,98],
-  'SN1': [328,172],
+  'SN1': [328,172], # Superior-nasal
   'SN2': [362,134],
-  'N1': [354,230],
+  'N1': [354,230],  # Nasal
   'N2': [403,231],
-  'IN1': [328,289],
+  'IN1': [328,289], # Inferior-nasal
   'IN2': [364,325],
-  'I1': [270,314],
+  'I1': [270,314],  # Inferior
   'I2': [269,362],
-  'IT1': [211,290],
+  'IT1': [211,290], # Inferior-temporal
   'IT2': [173,324],
-  'T1': [184,230],
+  'T1': [184,230],  # Temporal
   'T2': [141,230],
-  'ST1': [210,171],  
+  'ST1': [210,171], # Superior-temporal   
   'ST2': [176,138]
 }
 
@@ -246,11 +277,11 @@ epithelium_os_crops = {
   'SN2': [564,649]
 }
 
-# Padrão 2
+# Dicionários com coordenadas para o padrão 2
 pachymetry_os_cropsp2 = { 
-  'CO': [450,612],
-  'S1': [451,538],
-  'S2': [451,496],
+  'CO': [450,612], 
+  'S1': [451,538], 
+  'S2': [451,496], 
   'ST1': [504,558],
   'ST2': [531,532],
   'T1': [528,612],
@@ -287,9 +318,16 @@ epithelium_os_cropsp2 = {
   'SN2': [660,532]
 }
 
+# Lista representando as regiões periféricas usadas em análises específicas ou ordenação dos pontos
 lista = ['S', 'ST', 'T', 'IT', 'I', 'IN', 'N', 'SN']
 
 
+'''
+Função que constrói um dicionário com os recortes (coordenadas e dimensões) das regiões dos mapas de paquimetria
+e epitélio para serem processadas via OCR. O layout varia conforme o padrão do exame (1 ou 2).
+As chaves indicam o tipo de mapa (POD, POS, EOD, EOS), a região (ex: 'S1', 'IN2'), e o olho (OD = olho direito, OS = esquerdo).
+A estrutura de cada item: [x, y, largura, altura, caracteres esperados].
+'''
 def get_map_crops(padrao):
   try:
     if padrao == 1:
@@ -335,14 +373,15 @@ def get_map_crops(padrao):
     print('erro get_map_crops', e)
 
 
-def classifica_valor(texto):
-    texto_limpo = texto.strip()
-    if re.fullmatch(r'\d+', texto_limpo):
-        return "somente numero"
-    else:
-        return "misto"
-
-
+'''
+Funções que processam uma imagem para extrair informações via OCR a partir de pontos recortados pré-definidos.
+Para cada região (definida em 'pontos'), a função:
+- recorta a imagem;
+- redimensiona e aplica filtro de desfoque para melhorar OCR;
+- realiza OCR considerando uma lista de caracteres permitidos;
+- salva a imagem do recorte com o valor extraído no nome;
+- armazena o valor extraído no dicionário row_data.
+'''
 def getting_infos_data(row_data, img, pontos):
     try:
         paciente_base = img.filename.split('\\')[-2] + '___' + img.filename.split('\\')[-1].split('__')[0]
@@ -363,7 +402,6 @@ def getting_infos_data(row_data, img, pontos):
     except Exception as e:
         print('erro getting_infos_data', e)
         return row_data
-
 
 def getting_exam_data(row_data, img, pontos):
     try:
@@ -390,7 +428,6 @@ def getting_exam_data(row_data, img, pontos):
         print('erro getting_exam_data', e)
         return row_data
     
-
 def getting_maps_data(row_data, img, pontos):
     try:
         paciente_base = img.filename.split('\\')[-2] + '___' + img.filename.split('\\')[-1].split('__')[0]
@@ -416,6 +453,13 @@ def getting_maps_data(row_data, img, pontos):
         return row_data
 
 
+'''
+Função para separar os dados extraídos em dois dicionários distintos: um para o olho esquerdo (OS) e outro para o olho direito (OD).
+Caso a chave não contenha 'OS' nem 'OD', distribui os dados conforme regras específicas:
+- 'Eye' vai para olho direito (OD)
+- 'Eye_2' vai para olho esquerdo (OS)
+- Outras chaves sem 'OS' ou 'OD' são atribuídas a ambos os olhos.
+'''
 def separa_dados_olhos(dados):
   try:
     dados_os = {}
@@ -439,11 +483,17 @@ def separa_dados_olhos(dados):
     print(e)    
 
 
+'''
+Função que cria DataFrames pandas a partir dos dados extraídos e os salva em arquivos Excel.
+Para cada diretório base em 'dados', ela agrupa os dados correspondentes,
+verifica se os dados contêm informações para ambos os olhos ou apenas um,
+e então gera uma ou duas planilhas Excel (separadas por olho) no diretório de saída.
+'''
 def create_dataframe(dados):
   try:
-    print('criando dataframe...')
+    print('Criando dataframe...')
 
-    #lista os diretorios carregados
+    # Lista dos diretórios base extraídos da primeira posição dos elementos em 'dados'
     lista_diretorios = []
     d = ''
     for dado in dados:
@@ -451,41 +501,45 @@ def create_dataframe(dados):
         lista_diretorios.append(dado[0])
         d = dado[0]
       
+    # Processa dados por diretório base
     for d in lista_diretorios:
-      dictionary_list = []
-      dictionary_list_od = []
-      dictionary_list_os = []
+      dictionary_list = []      # Para dados de um olho só
+      dictionary_list_od = []   # Dados para olho direito (OD)
+      dictionary_list_os = []   # Dados para olho esquerdo (OS)
       df_final = None
+
+      # Separa os dados daquele diretório em listas específicas
       for dado in dados:
         if dado[0] == d:
-          #verifica se os dados são dos dois olhos ou somente de um
-          if 'Eye_2' in dado[1]: #Dois olhos
+          # Se dados para ambos os olhos estão presentes, separa-os
+          if 'Eye_2' in dado[1]:
             dados_olhos = separa_dados_olhos(dado[1])
             dictionary_list_os.append(dados_olhos[0])
             dictionary_list_od.append(dados_olhos[1])
-          else: #apenas um olho
+          else:
             dictionary_list.append(dado[1])
 
-      #Se a lista 'dictionary_list_os' não for vazia significa que os dados em 
-      #questão são dos dois olhos, entao sao criadas as planilhas separadas, uma para cada olho
+      # Caso haja dados para ambos os olhos, cria planilhas separadas para OS e OD
       if len(dictionary_list_os) > 0:
+        # DataFrame olho esquerdo
         df_final = pd.DataFrame.from_dict(dictionary_list_os)
         timestr = time.strftime("%Y%m%d-%H%M%S")
-        df_final = df_final.apply(pd.to_numeric, errors='ignore')
-        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d+'_OS_RTVue_'+timestr+'.xlsx'))
+        df_final = df_final.apply(pd.to_numeric, errors='ignore')  # tenta converter valores para numérico
+        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d + '_OS_RTVue_' + timestr + '.xlsx'))
 
+        # DataFrame olho direito
         df_final = None
         df_final = pd.DataFrame.from_dict(dictionary_list_od)
         timestr = time.strftime("%Y%m%d-%H%M%S")
         df_final = df_final.apply(pd.to_numeric, errors='ignore')
-        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d+'_OD_RTVue_'+timestr+'.xlsx'))
+        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d + '_OD_RTVue_' + timestr + '.xlsx'))
 
-      #Nesse caso a planilha é criada normalmente
       else:
+        # Caso dados sejam de um olho só, gera apenas um arquivo Excel
         df_final = pd.DataFrame.from_dict(dictionary_list)
         timestr = time.strftime("%Y%m%d-%H%M%S")
         df_final = df_final.apply(pd.to_numeric, errors='ignore')
-        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d+'_RTVue_'+timestr+'.xlsx'))
+        df_final.to_excel(os.path.join(diretorio_raiz, OUTPUT_DIR, d + '_RTVue_' + timestr + '.xlsx'))
 
   except Exception as e:
     print(e)
@@ -494,6 +548,12 @@ def create_dataframe(dados):
   return True
 
 
+'''
+Função para listar arquivos de exames em um diretório base, percorrendo subpastas.
+Para cada arquivo encontrado nas subpastas, adiciona uma lista com:
+- o caminho completo do arquivo
+- o nome da subpasta onde o arquivo está localizado
+'''
 def listar_arquivos(diretorio_exames):
   lista_arquivos = []
   try:
@@ -509,11 +569,20 @@ def listar_arquivos(diretorio_exames):
     print('Erro ao listar os arquivos: ', e)
 
 
+'''
+Função para identificar o padrão da imagem (padrão 1 ou 2) com base no resultado do OCR em uma região específica.
+Recorta uma área fixa na imagem relacionada à paquimetria do olho direito ('CO' em pachymetry_od_crops),
+redimensiona essa área, realiza OCR buscando números,
+e decide o padrão:
+- Se o OCR extrai algum texto não vazio, retorna 1 (padrão 1).
+- Caso contrário, retorna 2 (padrão 2).
+Em caso de erro (ex: OCR falha), também retorna 2 como padrão padrão.
+'''
 def padrao_imagem(img):
   try:
     img_cropped = img.crop((pachymetry_od_crops['CO'][0], pachymetry_od_crops['CO'][1], pachymetry_od_crops['CO'][0] + L, pachymetry_od_crops['CO'][1] + A))
     img_cropped = resize_img(img_cropped, IMG_MAG)
-    ocr_result = reader.readtext(np.array(img_cropped), min_size=5, allowlist='0123456789')
+    ocr_result = reader.readtext(np.array(img_cropped), min_size=5, allowlist='0123456789')  # Executa OCR, buscando apenas dígitos numéricos
     
     if ocr_result[0][1] != '':
       return 1
@@ -523,6 +592,17 @@ def padrao_imagem(img):
     return 2
 
 
+'''
+Função que extrai informações de um arquivo de exame oftalmológico.
+Recebe um dicionário inicial (row_data) e uma lista "arquivo" onde o primeiro elemento é o caminho do arquivo
+e o segundo é o nome da subpasta/diretório.
+A função:
+- abre a imagem;
+- extrai dados do nome do arquivo para preencher metadados (nome, ID, olho, data, sexo, data nascimento);
+- detecta o padrão da imagem (padrão 1 ou 2);
+- extrai dados específicos da imagem por OCR, utilizando funções auxiliares para diferentes partes;
+- retorna uma lista com o nome da subpasta e o dicionário com os dados extraídos.
+'''
 def extrair_infomacoes_arquivo(row_data, arquivo):
 
   padrao = 0
@@ -552,6 +632,15 @@ def extrair_infomacoes_arquivo(row_data, arquivo):
   return [arquivo[1], row_data]
 
 
+'''
+Função principal para iniciar o processo de leitura das imagens de exames.
+Recebe o diretório base onde as imagens estão armazenadas.
+Realiza os seguintes passos:
+- Lista todos os arquivos e suas subpastas dentro do diretório informado.
+- Para cada arquivo listado, extrai as informações usando OCR e outras funções auxiliares.
+- Armazena os resultados em uma lista.
+- Cria dataframes a partir dos dados extraídos e salva-os em arquivos Excel.
+'''
 def iniciar_processo_leitura_imagens(diretorio_exames):
     try:
         arquivos = listar_arquivos(diretorio_exames)
@@ -562,6 +651,15 @@ def iniciar_processo_leitura_imagens(diretorio_exames):
         print(e)
 
 
+'''
+Função principal que configura o OCR e inicia o processo de leitura das imagens.
+Parâmetros:
+- diretorio_exames: caminho para o diretório contendo as imagens dos exames.
+Passos:
+- Inicializa o leitor OCR da biblioteca EasyOCR para a língua portuguesa, utilizando GPU se disponível.
+- Define o diretório raiz como o diretório onde este script está localizado.
+- Chama a função que lista e processa as imagens presentes no diretório especificado.
+'''
 def SarmentoOCR(diretorio_exames):
     global reader, diretorio_raiz
     try:
